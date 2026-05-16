@@ -1,0 +1,19 @@
+# Core training stack
+unsloth>=2025.5.0
+trl>=0.12.0
+transformers>=4.45.0
+accelerate>=0.34.0
+bitsandbytes>=0.43.0
+peft>=0.13.0
+
+# Data
+datasets>=3.0.0
+huggingface_hub>=0.26.0
+
+# Eval
+vllm>=0.6.0
+openai>=1.50.0
+tqdm
+
+# (Sunday) optional GRPO
+# trl >= 0.12.0 already includes GRPOTrainer
