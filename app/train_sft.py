@@ -9,15 +9,17 @@ Usage:
     python train_sft.py --learning-rate 1e-4 --epochs 3   # iterate hyperparams
 """
 
+# Unsloth must be imported before trl/transformers/peft for optimizations to apply.
+import unsloth  # noqa: F401
+from unsloth import FastLanguageModel
+
 import argparse
 import json
 from pathlib import Path
 
 import torch
 from datasets import Dataset
-from transformers import TrainingArguments
-from trl import SFTTrainer
-from unsloth import FastLanguageModel
+from trl import SFTConfig, SFTTrainer
 
 
 def load_jsonl_dataset(path):
@@ -68,7 +70,7 @@ def main():
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        use_gradient_checkpointing="unsloth",  # ~30% VRAM savings
+        use_gradient_checkpointing="unsloth",
         random_state=42,
     )
 
@@ -84,31 +86,37 @@ def main():
     steps_per_epoch = max(1, len(dataset) // effective_batch)
     print(f"Approx steps per epoch: {steps_per_epoch}")
 
-    # ---- Trainer ----
+    # ---- Trainer (TRL 0.20+ API) ----
+    # Key changes from older TRL:
+    #   - SFTConfig replaces TrainingArguments + the SFT-specific kwargs
+    #   - processing_class replaces the old `tokenizer` argument
+    #   - max_length replaces max_seq_length inside the config
+    sft_config = SFTConfig(
+        output_dir=args.output,
+        dataset_text_field="text",
+        max_length=args.max_seq_length,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        warmup_steps=args.warmup_steps,
+        num_train_epochs=1 if args.smoke else args.epochs,
+        learning_rate=args.learning_rate,
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=10,
+        save_steps=500,
+        save_total_limit=2,
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="cosine",
+        seed=42,
+        report_to="none",  # set to "wandb" if you want live tracking
+    )
+
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
-        args=TrainingArguments(
-            output_dir=args.output,
-            per_device_train_batch_size=args.batch_size,
-            gradient_accumulation_steps=args.grad_accum,
-            warmup_steps=args.warmup_steps,
-            num_train_epochs=1 if args.smoke else args.epochs,
-            learning_rate=args.learning_rate,
-            fp16=not torch.cuda.is_bf16_supported(),
-            bf16=torch.cuda.is_bf16_supported(),
-            logging_steps=10,
-            save_steps=500,
-            save_total_limit=2,
-            optim="adamw_8bit",
-            weight_decay=0.01,
-            lr_scheduler_type="cosine",
-            seed=42,
-            report_to="none",  # set to "wandb" if you want live tracking
-        ),
+        args=sft_config,
     )
 
     trainer.train()
