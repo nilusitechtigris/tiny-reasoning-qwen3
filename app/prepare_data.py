@@ -1,12 +1,12 @@
-"""Download and filter OpenThoughts-114k for math reasoning SFT.
+"""Download and prep OpenR1-Math-220k for math reasoning SFT.
 
 Outputs a JSONL file with one {"text": "..."} record per training example,
 ready for Unsloth's SFTTrainer.
 
 Usage:
-    python prepare_data.py                  # default: 15k math examples
     python prepare_data.py --inspect        # print first raw row, exit
-    python prepare_data.py --max-examples 5000 --domain-filter math
+    python prepare_data.py                  # default: 15k examples from curated subset
+    python prepare_data.py --max-examples 5000
 """
 
 import argparse
@@ -15,9 +15,8 @@ from pathlib import Path
 
 from datasets import load_dataset
 
-# Wraps each example in Qwen3's chatml template. The base model has never seen
-# this format, so SFT will teach it: "when you see this template, produce
-# <think>...</think> reasoning then a final boxed answer."
+# OpenR1-Math-220k uses <think>...</think> for reasoning and \boxed{} for answers
+# (verified by their Math Verify pipeline). We match that format.
 SYSTEM_PROMPT = (
     "You are a careful reasoner. Think step by step inside <think>...</think> "
     "tags, then give the final answer in \\boxed{}."
@@ -25,62 +24,70 @@ SYSTEM_PROMPT = (
 
 
 def format_example(row):
-    """Convert one OpenThoughts row into a single training string.
+    """Convert one OpenR1-Math row into a training string.
 
-    OpenThoughts-114k uses a `conversations` list of {from, value} dicts.
-    Fallbacks handle related datasets if you swap in a different one.
+    OpenR1-Math-220k typically has:
+      - 'problem'    : the math problem text
+      - 'solution'   : original NuminaMath solution (not the R1 trace)
+      - 'messages'   : list of {role, content} including R1's <think>...</think> reasoning
+      - 'generations': sometimes a list of raw R1 generations
     """
-    if "conversations" in row and isinstance(row["conversations"], list):
-        convs = row["conversations"]
-        user_msgs = [c.get("value", "") for c in convs if c.get("from") in ("human", "user")]
-        asst_msgs = [c.get("value", "") for c in convs if c.get("from") in ("gpt", "assistant")]
-        problem = user_msgs[0] if user_msgs else ""
-        solution = asst_msgs[0] if asst_msgs else ""
-    else:
-        problem = row.get("problem") or row.get("question") or ""
-        solution = row.get("solution") or row.get("response") or ""
+    problem = row.get("problem", "")
 
-    if not problem or not solution:
+    # Prefer the R1 reasoning trace from the messages column
+    completion = ""
+    if "messages" in row and isinstance(row["messages"], list) and row["messages"]:
+        for msg in row["messages"]:
+            if msg.get("role") == "assistant":
+                completion = msg.get("content", "")
+                break
+    elif "generations" in row and row["generations"]:
+        gens = row["generations"]
+        completion = gens[0] if isinstance(gens, list) else str(gens)
+    elif "solution" in row:
+        completion = row.get("solution", "")
+
+    if not problem or not completion:
         return None
 
     text = (
         f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
         f"<|im_start|>user\n{problem}<|im_end|>\n"
-        f"<|im_start|>assistant\n{solution}<|im_end|>"
+        f"<|im_start|>assistant\n{completion}<|im_end|>"
     )
     return {"text": text}
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="open-thoughts/OpenThoughts-114k")
-    ap.add_argument("--domain-filter", default="math",
-                    help="Substring to match against the 'domain' column. Empty string = no filter.")
+    ap.add_argument("--dataset", default="open-r1/OpenR1-Math-220k")
+    ap.add_argument("--subset", default="default",
+                    help="'default' (94k, curated, best for SFT) or 'extended' (131k more).")
     ap.add_argument("--max-examples", type=int, default=15000)
     ap.add_argument("--max-length-chars", type=int, default=12000,
                     help="Drop examples whose formatted text exceeds this (proxy for token length).")
     ap.add_argument("--output", default="data/train.jsonl")
     ap.add_argument("--inspect", action="store_true",
-                    help="Print the first raw row from the dataset and exit (for schema sanity-check).")
+                    help="Print first raw row's columns and a content snippet, then exit.")
     args = ap.parse_args()
 
-    print(f"Loading {args.dataset} ...")
-    ds = load_dataset(args.dataset, split="train")
+    print(f"Loading {args.dataset} ({args.subset}) ...")
+    ds = load_dataset(args.dataset, args.subset, split="train")
     print(f"Initial size: {len(ds):,}")
     print(f"Columns: {ds.column_names}")
 
     if args.inspect:
         print("\n=== First raw row ===")
-        print(json.dumps(ds[0], indent=2, default=str)[:2000])
+        row = ds[0]
+        for k, v in row.items():
+            if isinstance(v, (list, dict)):
+                length = len(v) if hasattr(v, "__len__") else "?"
+                print(f"\n{k} (type={type(v).__name__}, len={length}):")
+                print(str(v)[:1200])
+            else:
+                print(f"\n{k}: {str(v)[:1200]}")
         return
 
-    # Optional domain filter (OpenThoughts has a `domain` column with values like "math", "code", "science")
-    if args.domain_filter and "domain" in ds.column_names:
-        before = len(ds)
-        ds = ds.filter(lambda r: args.domain_filter.lower() in str(r.get("domain", "")).lower())
-        print(f"After domain filter ('{args.domain_filter}'): {len(ds):,} (was {before:,})")
-
-    # Format + length filter + cap
     formatted = []
     skipped_empty = 0
     skipped_long = 0
