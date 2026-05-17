@@ -15,9 +15,9 @@ Set env vars before running:
 Outputs: results/results.csv
 
 Usage:
-    python eval.py --model outputs/qwen3-reasoning-1.7b --limit 100    # quick check
-    python eval.py --model outputs/qwen3-reasoning-1.7b                 # full run
-    python eval.py --skip-apis --model outputs/qwen3-reasoning-1.7b     # local-only
+    python eval.py --model outputs/qwen3-reasoning-1.7b-merged --limit 100    # quick check
+    python eval.py --model outputs/qwen3-reasoning-1.7b-merged                # full run
+    python eval.py --skip-apis --model outputs/qwen3-reasoning-1.7b-merged    # local-only
 """
 
 import argparse
@@ -79,14 +79,27 @@ def load_math500(limit=None):
     return problems[:limit] if limit else problems
 
 
-# ---------- Generators ----------
+# ---------- Prompt formatting ----------
+# We build the chatml prompt manually instead of relying on tokenizer.chat_template,
+# which can be missing after Unsloth's merge process strips it.
+
+def build_chatml_prompt(problem):
+    return (
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{problem}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
 
 def build_messages(problem):
+    """Used by the API generators (Together / OpenAI) where chat templates are server-side."""
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": problem},
     ]
 
+
+# ---------- Generators ----------
 
 def make_openai_compat_gen(model_name, base_url, api_key):
     from openai import OpenAI
@@ -104,28 +117,29 @@ def make_openai_compat_gen(model_name, base_url, api_key):
 
 
 def make_local_gen(model_path, max_model_len=4096):
-    """Load a model with vLLM and return a generator function."""
+    """Load a model with vLLM, return a generator that builds prompts manually."""
     from vllm import LLM, SamplingParams
-    from transformers import AutoTokenizer
 
     llm = LLM(model=model_path, dtype="bfloat16", max_model_len=max_model_len,
               gpu_memory_utilization=0.85)
-    tok = AutoTokenizer.from_pretrained(model_path)
-    sampling = SamplingParams(max_tokens=2048, temperature=0.0)
+    sampling = SamplingParams(
+        max_tokens=2048,
+        temperature=0.0,
+        stop=["<|im_end|>"],  # stop generation at the chatml end token
+    )
 
     def gen(problem):
-        text = tok.apply_chat_template(
-            build_messages(problem), tokenize=False, add_generation_prompt=True
-        )
-        out = llm.generate([text], sampling, use_tqdm=False)
+        prompt = build_chatml_prompt(problem)
+        out = llm.generate([prompt], sampling, use_tqdm=False)
         return out[0].outputs[0].text
-    return gen, llm  # return llm so we can free it later
+    return gen, llm
 
 
 # ---------- Eval loop ----------
 
 def evaluate(gen, problems, label):
     correct = 0
+    errors = 0
     for p in tqdm(problems, desc=label):
         try:
             response = gen(p["problem"])
@@ -133,7 +147,11 @@ def evaluate(gen, problems, label):
             if is_correct(pred, p["answer"]):
                 correct += 1
         except Exception as e:
-            print(f"\n  error on problem: {e}")
+            errors += 1
+            if errors <= 3:  # only print first 3 errors to avoid flooding
+                print(f"\n  error on problem ({errors}): {e}")
+    if errors:
+        print(f"  total errors in {label}: {errors}/{len(problems)}")
     return correct / len(problems) if problems else 0.0
 
 
