@@ -39,10 +39,16 @@ SYSTEM_PROMPT = (
 # ---------- Answer extraction & comparison ----------
 
 def extract_boxed(text):
-    """Pull the answer out of \\boxed{...}, falling back to the last number."""
+    """Pull the FIRST \\boxed{...} from text.
+
+    R1-style models often produce the real answer once, then ramble or loop
+    after. Taking the first match captures the model's actual answer and
+    ignores any post-answer noise.
+    """
     matches = re.findall(r"\\boxed\{([^{}]+)\}", text)
     if matches:
-        return matches[-1].strip()
+        return matches[0].strip()
+    # Fallback: last number in text (handles models that don't use \boxed)
     nums = re.findall(r"-?\d+\.?\d*", text)
     return nums[-1] if nums else ""
 
@@ -80,8 +86,6 @@ def load_math500(limit=None):
 
 
 # ---------- Prompt formatting ----------
-# We build the chatml prompt manually instead of relying on tokenizer.chat_template,
-# which can be missing after Unsloth's merge process strips it.
 
 def build_chatml_prompt(problem):
     return (
@@ -92,7 +96,6 @@ def build_chatml_prompt(problem):
 
 
 def build_messages(problem):
-    """Used by the API generators (Together / OpenAI) where chat templates are server-side."""
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": problem},
@@ -119,13 +122,29 @@ def make_openai_compat_gen(model_name, base_url, api_key):
 def make_local_gen(model_path, max_model_len=4096):
     """Load a model with vLLM, return a generator that builds prompts manually."""
     from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
 
     llm = LLM(model=model_path, dtype="bfloat16", max_model_len=max_model_len,
               gpu_memory_utilization=0.85)
+
+    # Resolve stop token IDs from the tokenizer — works even when the
+    # tokenizer's eos_token isn't properly set after a merge.
+    tok = AutoTokenizer.from_pretrained(model_path)
+    stop_ids = []
+    try:
+        im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+        if im_end_id is not None and im_end_id != tok.unk_token_id:
+            stop_ids.append(im_end_id)
+    except Exception:
+        pass
+    if tok.eos_token_id is not None and tok.eos_token_id not in stop_ids:
+        stop_ids.append(tok.eos_token_id)
+
     sampling = SamplingParams(
-        max_tokens=2048,
+        max_tokens=3500,           # bumped from 2048 — give harder problems room
         temperature=0.0,
-        stop=["<|im_end|>"],  # stop generation at the chatml end token
+        stop=["<|im_end|>"],       # string match (catches if model emits as text)
+        stop_token_ids=stop_ids or None,  # token-id match (catches when emitted as a token)
     )
 
     def gen(problem):
@@ -148,7 +167,7 @@ def evaluate(gen, problems, label):
                 correct += 1
         except Exception as e:
             errors += 1
-            if errors <= 3:  # only print first 3 errors to avoid flooding
+            if errors <= 3:
                 print(f"\n  error on problem ({errors}): {e}")
     if errors:
         print(f"  total errors in {label}: {errors}/{len(problems)}")
@@ -187,7 +206,7 @@ def main():
         print(f"\n--- Loading trained model: {args.model} ---")
         gen, llm = make_local_gen(args.model)
         run_pair("qwen3-1.7b-reasoning (ours)", gen)
-        del llm  # free VRAM before loading base
+        del llm
 
     # 2) Base control
     if args.base:
